@@ -1,0 +1,77 @@
+# ── Project outputs (regenerable) ──
+/bin/
+/results/
+*.log
+
+# ── Go ──
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/vendor/
+go.work
+go.work.sum
+
+# ── Rust (bench/axum) ──
+**/target/
+**/*.rs.bk
+
+# ── .NET (bench/aspnet) ──
+**/bin/
+**/obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+TestResults/
+publish/
+**/aspnet-publish/
+
+# ── Zig (bench/kabelweb) ──
+.zig-cache/
+**/.zig-cache/
+**/zig-cache/
+**/zig-out/
+
+# ── Python (scripts/) ──
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Vendored wrk (tools/wrk) build outputs ──
+tools/wrk/obj/
+tools/wrk/wrk
+
+# ── OS / editors ──
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ── Misc ──
+.env
+.env.*
+!.env.example
+*.tmp
+*.bak
+*.orig

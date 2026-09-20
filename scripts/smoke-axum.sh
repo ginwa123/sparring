@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# scripts/smoke-axum.sh — quick endpoint smoke test for the Axum bench server.
+# Starts the server, curls each endpoint, kills it. Exits 0 on all-pass.
+set -u
+SRV=/home/ginwa/sparringhttp/bin/axum-bench
+LOG=/tmp/axum_smoke.log
+"$SRV" >"$LOG" 2>&1 &
+SRV_PID=$!
+cleanup() {
+  kill "$SRV_PID" 2>/dev/null || true
+  # Do NOT wait on it — the bash 'wait' builtin hangs forever on children
+  # that have already reaped themselves (zig/go/dotnet/rust servers exit on SIGTERM).
+}
+trap cleanup EXIT
+sleep 1
+fail=0
+t() {
+  local name="$1" want="$2"; shift 2
+  local got
+  got=$(curl -s -m 3 "$@" 2>/dev/null)
+  if [[ "$got" == *"$want"* ]]; then
+    echo "PASS $name: $got"
+  else
+    echo "FAIL $name: want '$want' got '$got'"
+    fail=1
+  fi
+}
+t health OK http://127.0.0.1:29590/health
+t hello "Hello, Alice!" http://127.0.0.1:29590/hello/Alice
+t users '"username":"bob"' -X POST -H 'Content-Type: application/json' -d '{"username":"bob","email":"b@x.com"}' http://127.0.0.1:29590/users
+t echo 'echo-me' -X POST -d 'echo-me' http://127.0.0.1:29590/api/v1/echo
+t product '"name":"Ergonomic Wireless Mouse"' http://127.0.0.1:29590/api/v1/product/42
+t product-id '"id":42' http://127.0.0.1:29590/api/v1/product/42
+t checkout '"total":165.26' -X POST -H 'Content-Type: application/json' -d '{"user_id":"u-7f3a9c","items":[{"sku":"SKU-0042-BLK","qty":2,"price":29.99},{"sku":"SKU-0091-CABLE","qty":1,"price":12.49},{"sku":"SKU-0117-PAD","qty":3,"price":8.75},{"sku":"SKU-0200-STAND","qty":1,"price":45.0},{"sku":"SKU-0333-MAT","qty":2,"price":19.95}],"coupon":"SAVE10","customer":{"email":"ada@example.com","phone":"+49-170-123456"},"shipping":{"name":"Ada Lovelace","street":"12 Algorithm Ave","city":"Berlin","zip":"10115","country":"DE"},"payment":{"method":"card","last4":"4242"},"notes":"Leave at reception if absent, ring twice on delivery"}' http://127.0.0.1:29590/api/v1/checkout
+t checkout-items '"items":9' -X POST -H 'Content-Type: application/json' -d '{"user_id":"u-7f3a9c","items":[{"sku":"SKU-0042-BLK","qty":2,"price":29.99},{"sku":"SKU-0091-CABLE","qty":1,"price":12.49},{"sku":"SKU-0117-PAD","qty":3,"price":8.75},{"sku":"SKU-0200-STAND","qty":1,"price":45.0},{"sku":"SKU-0333-MAT","qty":2,"price":19.95}],"coupon":"SAVE10"}' http://127.0.0.1:29590/api/v1/checkout
+if [[ $fail -eq 0 ]]; then
+  echo ALL_PASS
+fi
+exit $fail

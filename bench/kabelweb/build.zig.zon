@@ -1,0 +1,16 @@
+.{
+    .name = .kabelweb_bench,
+    .version = "0.0.0",
+    .fingerprint = 0xa2c811deb63e734e,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kabelweb = .{
+            .path = "../../../kabelweb",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}

@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>aspnet_bench</RootNamespace>
+    <AssemblyName>aspnet-bench</AssemblyName>
+    <!-- Bench deploy: self-contained single file, no ICU (invariant mode) so the
+         binary runs on the archlinux bench image with only openssl/zlib present. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>linux-x64</RuntimeIdentifier>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+
+</Project>
