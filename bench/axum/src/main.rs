@@ -17,12 +17,17 @@
 //   Fixed cart subtotal = 183.62, discount = 18.362, total = 165.26, items = 9.
 use axum::{
     body::Bytes,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Query,
+    },
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use serde::Deserialize;
+use std::collections::HashMap;
 
 const MAX_BODY: usize = 32 * 1024;
 
@@ -48,11 +53,12 @@ async fn health() -> Response {
     text(StatusCode::OK, "OK")
 }
 
+fn hello_body(name: &str) -> String {
+    format!("Hello, {name}! (greeting: hello, mood: neutral)")
+}
+
 async fn hello(axum::extract::Path(name): axum::extract::Path<String>) -> Response {
-    text(
-        StatusCode::OK,
-        format!("Hello, {name}! (greeting: hello, mood: neutral)"),
-    )
+    text(StatusCode::OK, hello_body(&name))
 }
 
 async fn echo(body: Bytes) -> Response {
@@ -124,6 +130,22 @@ struct Checkout {
     coupon: String,
 }
 
+fn checkout_totals(items: &[Item], coupon: &str) -> (f64, f64, f64, i64) {
+    let mut subtotal = 0.0f64;
+    let mut count = 0i64;
+    for it in items {
+        subtotal += it.qty as f64 * it.price;
+        count += it.qty;
+    }
+    let discount = if coupon == "SAVE10" {
+        subtotal * 0.10
+    } else {
+        0.0
+    };
+    let total = subtotal - discount;
+    (subtotal, discount, total, count)
+}
+
 async fn checkout(body: Bytes) -> Response {
     if body.len() > MAX_BODY {
         return text(StatusCode::PAYLOAD_TOO_LARGE, "body too large");
@@ -135,21 +157,11 @@ async fn checkout(body: Bytes) -> Response {
     if cart.items.is_empty() {
         return text(StatusCode::BAD_REQUEST, "invalid JSON");
     }
-    let mut subtotal = 0.0f64;
-    let mut count = 0i64;
-    for it in &cart.items {
-        subtotal += it.qty as f64 * it.price;
-        count += it.qty;
-    }
+    let (_subtotal, _discount, total, count) =
+        checkout_totals(&cart.items, &cart.coupon);
     if count == 0 {
         return text(StatusCode::BAD_REQUEST, "invalid JSON");
     }
-    let discount = if cart.coupon == "SAVE10" {
-        subtotal * 0.10
-    } else {
-        0.0
-    };
-    let total = subtotal - discount;
     json(
         StatusCode::OK,
         format!(
@@ -157,6 +169,80 @@ async fn checkout(body: Bytes) -> Response {
             cart.user_id,
         ),
     )
+}
+
+async fn ws_handler(ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(handle_ws).into_response()
+}
+
+async fn handle_ws(mut socket: WebSocket) {
+    loop {
+        match socket.recv().await {
+            Some(Ok(Message::Text(t))) => {
+                if socket.send(Message::Text(t)).await.is_err() {
+                    break;
+                }
+            }
+            Some(Ok(Message::Binary(b))) => {
+                if socket.send(Message::Binary(b)).await.is_err() {
+                    break;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                if socket.send(Message::Pong(p)).await.is_err() {
+                    break;
+                }
+            }
+            Some(Ok(Message::Close(_))) | None => break,
+            _ => {}
+        }
+    }
+}
+
+async fn events() -> Response {
+    let mut body = String::new();
+    for i in 1..=5 {
+        body.push_str(&format!("id: {i}\nevent: tick\ndata: {{\"seq\":{i}}}\n\n"));
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+async fn page(Query(params): Query<HashMap<String, String>>) -> Response {
+    let name = params.get("name").map(|s| s.as_str()).filter(|s| !s.is_empty()).unwrap_or("HTTP");
+    let escaped = html_escape(name);
+    let body = format!(
+        "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>Hello</title></head>\
+<body><h1>Hello, {escaped}!</h1></body></html>"
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }
 
 fn app() -> Router {
@@ -167,6 +253,9 @@ fn app() -> Router {
         .route("/api/v1/echo", post(echo))
         .route("/api/v1/product/{id}", get(product))
         .route("/api/v1/checkout", post(checkout))
+        .route("/ws", get(ws_handler))
+        .route("/events", get(events))
+        .route("/page", get(page))
 }
 
 fn main() {

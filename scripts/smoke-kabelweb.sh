@@ -31,6 +31,31 @@ t product '"name":"Ergonomic Wireless Mouse"' http://127.0.0.1:29590/api/v1/prod
 t product-id '"id":42' http://127.0.0.1:29590/api/v1/product/42
 t checkout '"total":165.26' -X POST -H 'Content-Type: application/json' -d '{"user_id":"u-7f3a9c","items":[{"sku":"SKU-0042-BLK","qty":2,"price":29.99},{"sku":"SKU-0091-CABLE","qty":1,"price":12.49},{"sku":"SKU-0117-PAD","qty":3,"price":8.75},{"sku":"SKU-0200-STAND","qty":1,"price":45.0},{"sku":"SKU-0333-MAT","qty":2,"price":19.95}],"coupon":"SAVE10","customer":{"email":"ada@example.com","phone":"+49-170-123456"},"shipping":{"name":"Ada Lovelace","street":"12 Algorithm Ave","city":"Berlin","zip":"10115","country":"DE"},"payment":{"method":"card","last4":"4242"},"notes":"Leave at reception if absent, ring twice on delivery"}' http://127.0.0.1:29590/api/v1/checkout
 t checkout-items '"items":9' -X POST -H 'Content-Type: application/json' -d '{"user_id":"u-7f3a9c","items":[{"sku":"SKU-0042-BLK","qty":2,"price":29.99},{"sku":"SKU-0091-CABLE","qty":1,"price":12.49},{"sku":"SKU-0117-PAD","qty":3,"price":8.75},{"sku":"SKU-0200-STAND","qty":1,"price":45.0},{"sku":"SKU-0333-MAT","qty":2,"price":19.95}],"coupon":"SAVE10"}' http://127.0.0.1:29590/api/v1/checkout
+t page 'Hello, Alice!' "http://127.0.0.1:29590/page?name=Alice"
+t sse 'event: tick' "http://127.0.0.1:29590/events"
+# WS echo check (graceful degradation: websockets lib -> wscat -> SKIP)
+if python3 -c "import websockets" 2>/dev/null; then
+  if python3 -c 'import asyncio,sys;from websockets import connect
+async def main():
+    async with connect("ws://127.0.0.1:29590/ws",open_timeout=3,close_timeout=3) as ws:
+        await ws.send("hello-ws");got=await asyncio.wait_for(ws.recv(),timeout=3)
+        sys.exit(0 if "hello-ws" in str(got) else 1)
+asyncio.run(main())' 2>/dev/null; then
+    echo "PASS ws: echo ok"
+  else
+    echo "FAIL ws: echo mismatch"
+    fail=1
+  fi
+elif command -v wscat >/dev/null 2>&1; then
+  if printf 'hello-ws' | timeout 8 wscat -c ws://127.0.0.1:29590/ws 2>/dev/null | grep -q 'hello-ws'; then
+    echo "PASS ws: echo ok"
+  else
+    echo "FAIL ws: echo mismatch"
+    fail=1
+  fi
+else
+  echo "SKIP ws (no client)"
+fi
 if [[ $fail -eq 0 ]]; then
   echo ALL_PASS
 fi

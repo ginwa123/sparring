@@ -103,3 +103,19 @@ scripts/run-bench.sh            # writes results/*.json, results/*.csv
   (the user's pre-existing `keen_banzai` container is off-limits).
 - No numbers in the report are estimated; anything not measured is labelled
   "not measured".
+
+## New endpoints (page / SSE / WebSocket)
+
+- `GET /ws` — RFC6455 WebSocket echo on all four servers. Smoke-gated only
+  (wrk cannot speak WS).
+- `GET /events` — SSE: `Content-Type: text/event-stream`, 5 events
+  `id: i` / `event: tick` / `data: {"seq":i}` then close. Smoke/gate-checked;
+  no wrk sweep (wrk cannot do SSE).
+- `GET /page?name=X` — HTML: `Content-Type: text/html; charset=utf-8`,
+  `<!doctype html>`, contains `Hello, X!`. Covered by smoke checks,
+  correctness gate, and a wrk sweep `page_c${c}_r${rep}`.
+
+## Criterion micro-benchmarks (axum routing)
+
+- Live in `bench/axum/benches/routing.rs`.
+- Run: `cargo bench --manifest-path bench/axum/Cargo.toml`

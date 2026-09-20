@@ -102,6 +102,110 @@ fn checkoutHandler(ctx: gserverz.HttpContext, req: gserverz.HttpRequest, res: gs
     return res.jsonResponse(.{ .status_code = 200, .data = json_text });
 }
 
+const ws_frames = gserverz.ws_frames;
+
+fn wsEchoHandler(
+    ctx: gserverz.HttpContext,
+    req: gserverz.HttpRequest,
+    server_ptr: *anyopaque,
+    client_fd: i32,
+    client_id: *[16]u8,
+) !void {
+    const server: *gserverz.GinwaServer = @ptrCast(@alignCast(server_ptr));
+    _ = req;
+    _ = client_id;
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = server.recvFromClient(client_fd, &buf) catch return;
+        if (n == 0) return; // peer closed
+        var frame = ws_frames.parseFrame(ctx.allocator, buf[0..n]) catch |err| switch (err) {
+            error.IncompleteFrame => continue,
+            else => return,
+        };
+        defer frame.deinit(ctx.allocator);
+        switch (frame.opcode) {
+            .text => {
+                const echo = ws_frames.encodeFrame(ctx.allocator, .{ .opcode = .text, .payload = frame.payload }) catch continue;
+                defer ctx.allocator.free(echo);
+                _ = server.sendToClient(client_fd, echo) catch return;
+            },
+            .ping => {
+                const pong = ws_frames.encodeFrame(ctx.allocator, .{ .opcode = .pong, .payload = frame.payload }) catch continue;
+                defer ctx.allocator.free(pong);
+                _ = server.sendToClient(client_fd, pong) catch return;
+            },
+            .close => return,
+            else => {},
+        }
+    }
+}
+
+// Finite 5-event SSE-shaped stream served as a plain GET handler.
+// The framework `sse` route shape is built for long-lived streams
+// (client registered with SseManager, handler returns WouldBlock and the
+// connection stays open with heartbeats) — wrong fit for a bounded
+// 5-event body, so we return the full event stream with SSE headers.
+fn eventsHandler(ctx: gserverz.HttpContext, req: gserverz.HttpRequest, res: gserverz.HttpResponse) !gserverz.HttpResponse {
+    _ = req;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(ctx.allocator);
+    for (1..6) |i| {
+        const chunk = std.fmt.allocPrint(ctx.allocator, "id: {d}\nevent: tick\ndata: {{\"seq\":{d}}}\n\n", .{ i, i }) catch {
+            return gserverz.response.internalError("alloc failed", ctx.allocator);
+        };
+        defer ctx.allocator.free(chunk);
+        out.appendSlice(ctx.allocator, chunk) catch {
+            return gserverz.response.internalError("alloc failed", ctx.allocator);
+        };
+    }
+    const body = ctx.allocator.dupe(u8, out.items) catch {
+        return gserverz.response.internalError("alloc failed", ctx.allocator);
+    };
+    return res.withBody(body)
+        .setContentType("text/event-stream")
+        .withHeader("Cache-Control", "no-cache");
+}
+
+fn escapeHtml(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    for (s) |c| {
+        const ent: ?[]const u8 = switch (c) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&#39;",
+            else => null,
+        };
+        if (ent) |e| {
+            try out.appendSlice(allocator, e);
+        } else {
+            try out.append(allocator, c);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+const PAGE_HTML_TEMPLATE =
+    \\<!doctype html>
+    \\<html lang="en"><head><meta charset="utf-8" /><title>Hello</title></head>
+    \\<body><h1>Hello, {s}!</h1></body></html>
+;
+
+fn pageHandler(ctx: gserverz.HttpContext, req: gserverz.HttpRequest, res: gserverz.HttpResponse) !gserverz.HttpResponse {
+    const raw_q = req.query.get("name") orelse "HTTP";
+    const raw = if (raw_q.len == 0) "HTTP" else raw_q;
+    const escaped = escapeHtml(ctx.allocator, raw) catch {
+        return gserverz.response.internalError("alloc failed", ctx.allocator);
+    };
+    defer ctx.allocator.free(escaped);
+    const body = std.fmt.allocPrint(ctx.allocator, PAGE_HTML_TEMPLATE, .{escaped}) catch {
+        return gserverz.response.internalError("alloc failed", ctx.allocator);
+    };
+    return res.withBody(body).setContentType("text/html; charset=utf-8");
+}
+
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
         std.debug.print("Server error: {s}\n", .{@errorName(err)});
@@ -126,6 +230,9 @@ fn run(init: std.process.Init) !void {
     try gs.router.post("/api/v1/echo", echoHandler);
     try gs.router.get("/api/v1/product/:id", productHandler);
     try gs.router.post("/api/v1/checkout", checkoutHandler);
+    try gs.router.ws("/ws", wsEchoHandler);
+    try gs.router.get("/events", eventsHandler);
+    try gs.router.get("/page", pageHandler);
 
     std.debug.print("kabelweb bench server listening on 0.0.0.0:29590\n", .{});
     try gs.listenEventLoop(.{.loop_count = 4});

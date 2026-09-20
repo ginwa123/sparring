@@ -21,6 +21,51 @@ builder.WebHost.UseUrls("http://0.0.0.0:29590");
 builder.WebHost.ConfigureKestrel(o => o.AddServerHeader = false);
 var app = builder.Build();
 
+app.UseWebSockets();
+
+app.MapGet("/ws", async (HttpContext ctx) =>
+{
+    if (!ctx.WebSockets.IsWebSocketRequest)
+    {
+        ctx.Response.StatusCode = 400;
+        return;
+    }
+    using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
+    var buffer = new byte[4096];
+    while (true)
+    {
+        var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+        if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Close)
+        {
+            await ws.CloseAsync(result.CloseStatus ?? System.Net.WebSockets.WebSocketCloseStatus.NormalClosure, result.CloseStatusDescription, CancellationToken.None);
+            break;
+        }
+        await ws.SendAsync(new ArraySegment<byte>(buffer, 0, result.Count), result.MessageType, true, CancellationToken.None);
+    }
+});
+
+app.MapGet("/events", async (HttpContext ctx) =>
+{
+    ctx.Response.Headers.ContentType = "text/event-stream";
+    ctx.Response.Headers.CacheControl = "no-cache";
+    ctx.Response.Headers.Connection = "keep-alive";
+    for (int i = 1; i <= 5; i++)
+    {
+        await ctx.Response.WriteAsync($"id: {i}\nevent: tick\ndata: {{\"seq\":{i}}}\n\n");
+        await ctx.Response.Body.FlushAsync();
+    }
+});
+
+app.MapGet("/page", (HttpRequest req) =>
+{
+    string? name = req.Query["name"];
+    if (string.IsNullOrEmpty(name))
+        name = "HTTP";
+    string encoded = System.Net.WebUtility.HtmlEncode(name);
+    string html = $"<!doctype html><html><head><meta charset=\"utf-8\"><title>Hello</title></head><body><h1>Hello, {encoded}!</h1></body></html>";
+    return Results.Content(html, "text/html; charset=utf-8");
+});
+
 app.MapGet("/health", () => Results.Text("OK", "text/plain"));
 
 app.MapGet("/hello/{name}", (string name) =>

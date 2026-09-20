@@ -100,3 +100,20 @@ existing image. Use `rebuild all` after code changes.
 - Parsed: `results/bench_results.json`, `results/bench_results.csv`
 - Report: `BENCHMARK_RESULTS.md`, `BENCHMARK_RESULTS.html`
 - Method details: `IMPLEMENTATION_PLAN.md`
+
+## 7. New endpoints (page / SSE / WebSocket)
+
+- `GET /ws` — RFC6455 WebSocket echo (send text, get it back). Smoke-tested
+  only (wrk cannot do WS); smoke scripts try the `websockets` python lib,
+  then `wscat`, else print `SKIP ws (no client)` without failing.
+- `GET /events` — Server-Sent Events: `Content-Type: text/event-stream`,
+  5 events `id: i` / `event: tick` / `data: {"seq":i}` then close.
+  Smoke/gate-checked via curl (`event: tick`); no wrk sweep (wrk cannot do SSE).
+- `GET /page?name=X` — HTML page: `Content-Type: text/html; charset=utf-8`,
+  `<!doctype html>`, contains `Hello, X!`. Smoke/gate-checked plus a wrk
+  sweep `page_c${c}_r${rep}` (`GET /page?name=Bench`).
+
+## 8. Criterion micro-benchmarks (axum routing)
+
+- Live in `bench/axum/benches/routing.rs`.
+- Run: `cargo bench --manifest-path bench/axum/Cargo.toml`

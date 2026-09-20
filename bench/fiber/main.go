@@ -6,11 +6,15 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"html"
+	"html/template"
 	"log"
 	"strconv"
 
+	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -52,6 +56,10 @@ func productJSON(id int) string {
 		`"created_at":"2024-03-15T09:30:00Z","updated_at":"2026-09-01T14:22:10Z"}`,
 		id)
 }
+
+// pageTmpl renders GET /page via stdlib html/template (inline, no files).
+var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Hello</title></head><body><h1>Hello, {{.Name}}!</h1></body></html>`))
 
 func main() {
 	app := fiber.New(fiber.Config{
@@ -131,6 +139,52 @@ func main() {
 		return c.SendString(fmt.Sprintf(
 			`{"order_id":"ord-%s","status":"confirmed","items":%d,"total":%s,"currency":"USD","eta":"2026-09-25"}`,
 			cart.UserID, count, strconv.FormatFloat(total, 'f', 2, 64)))
+	})
+
+	app.Get("/ws", func(c *fiber.Ctx) error {
+		if !websocket.IsWebSocketUpgrade(c) {
+			return c.SendStatus(426)
+		}
+		return websocket.New(func(conn *websocket.Conn) {
+			for {
+				mt, msg, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				if mt != websocket.TextMessage && mt != websocket.BinaryMessage {
+					continue
+				}
+				if err := conn.WriteMessage(mt, msg); err != nil {
+					return
+				}
+			}
+		})(c)
+	})
+
+	app.Get("/events", func(c *fiber.Ctx) error {
+		c.Set("Content-Type", "text/event-stream")
+		c.Set("Cache-Control", "no-cache")
+		c.Set("Connection", "keep-alive")
+		c.Set("X-Accel-Buffering", "no")
+		c.Status(200)
+		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+			for i := 1; i <= 5; i++ {
+				fmt.Fprintf(w, "id: %d\nevent: tick\ndata: {\"seq\":%d}\n\n", i, i)
+				w.Flush()
+			}
+		})
+		return nil
+	})
+
+	app.Get("/page", func(c *fiber.Ctx) error {
+		name := c.Query("name")
+		if name == "" {
+			name = "HTTP"
+		}
+		c.Set("Content-Type", "text/html; charset=utf-8")
+		return pageTmpl.Execute(c.Response().BodyWriter(), map[string]any{
+			"Name": template.HTML(html.EscapeString(name)),
+		})
 	})
 
 	// Listen on all interfaces inside the container namespace; the sandbox

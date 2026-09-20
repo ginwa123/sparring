@@ -65,6 +65,8 @@ for fw in "${FWLIST[@]}"; do
   curl -s -m 2 "http://127.0.0.1:${PORT[$fw]}/api/v1/product/42" | grep -q '"id":42' || { echo "gate fail product $fw"; exit 1; }
   curl -s -m 2 -X POST -H 'Content-Type: application/json' -d '{"user_id":"u-7f3a9c","items":[{"sku":"SKU-0042-BLK","qty":2,"price":29.99}],"coupon":""}' \
     "http://127.0.0.1:${PORT[$fw]}/api/v1/checkout" | grep -q '"status":"confirmed"' || { echo "gate fail checkout $fw"; exit 1; }
+  curl -s -m 2 "http://127.0.0.1:${PORT[$fw]}/page?name=Gate" | grep -q "Hello, Gate!" || { echo "gate fail page $fw"; exit 1; }
+  curl -s -m 2 "http://127.0.0.1:${PORT[$fw]}/events" | grep -q "event: tick" || { echo "gate fail sse $fw"; exit 1; }
 done
 echo "[harness] correctness gates passed"
 
@@ -82,6 +84,9 @@ for rep in 1 2 3; do
       run_wrk "$fw" "health_c${c}_r${rep}" "http://127.0.0.1:$p/health" -c"$c" -d10s
       sleep 2
       run_wrk "$fw" "hello_c${c}_r${rep}"  "http://127.0.0.1:$p/hello/Bench" -c"$c" -d10s
+      sleep 2
+      # NOTE: /events (SSE) and /ws have no wrk sweep — wrk cannot do SSE/WS; smoke-gated only.
+      run_wrk "$fw" "page_c${c}_r${rep}"   "http://127.0.0.1:$p/page?name=Bench" -c"$c" -d10s
       sleep 2
       run_wrk "$fw" "product_c${c}_r${rep}" "http://127.0.0.1:$p/api/v1/product/1234" -c"$c" -d10s
       sleep 2
