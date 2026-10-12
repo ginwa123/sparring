@@ -117,3 +117,18 @@ existing image. Use `rebuild all` after code changes.
 
 - Live in `bench/axum/benches/routing.rs`.
 - Run: `cargo bench --manifest-path bench/axum/Cargo.toml`
+
+## 9. SQLite benchmark (separate sweep)
+
+- 7 `/db/*` endpoints (point read, list, LIKE search, insert, update, delete,
+  health) backed by real sqlite on every framework: kabelweb via **ruangsql**
+  (`../../../ruangsql` path dep), fiber via `modernc.org/sqlite`, aspnet via
+  `Microsoft.Data.Sqlite`, axum via `rusqlite` (bundled) + `r2d2`.
+- Seed: 5000 `user_{i}` rows, WAL + `busy_timeout=5000` + `synchronous=NORMAL`
+  + `cache_size=-64000`, `/tmp/sparring_sqlite.db` per container.
+- Parity: `bash scripts/smoke-db.sh <port> <label>` (must print `ALL_PASS`).
+- Run: `bash scripts/run-bench-sqlite.sh` (~20 min: 4 fw × read/write/mixed
+  × 3 concurrencies × 3 reps). Report: `SQLITE_BENCHMARK_RESULTS.md`.
+- Note: the bench image also ships `sqlite` (system lib for ruangsql) and
+  `libe_sqlite3.so` (ASP.NET native engine) — see `scripts/Containerfile`
+  and `sandbox.sh build_image`.

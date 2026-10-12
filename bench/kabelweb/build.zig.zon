@@ -7,6 +7,9 @@
         .kabelweb = .{
             .path = "../../../kabelweb",
         },
+        .ruangsql = .{
+            .path = "../../../ruangsql",
+        },
     },
     .paths = .{
         "build.zig",

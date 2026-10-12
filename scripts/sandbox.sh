@@ -189,6 +189,10 @@ build_image() {
      "$PROJECT/bin/fiber-bench" \
      "$PROJECT/bin/aspnet-bench" \
      "$PROJECT/bin/axum-bench" /tmp/sparringhttp_img/
+  # Microsoft.Data.Sqlite bundles its native engine as libe_sqlite3.so next
+  # to the single-file binary; the binary probes its own dir (/srv/) at
+  # runtime, so ship it alongside (see Containerfile COPY).
+  cp "$PROJECT/bin/aspnet-publish/libe_sqlite3.so" /tmp/sparringhttp_img/ 2>/dev/null || true
   podman build -t "$IMAGE" -f "$PROJECT/scripts/Containerfile" /tmp/sparringhttp_img
 }
 

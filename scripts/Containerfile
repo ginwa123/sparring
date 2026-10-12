@@ -2,12 +2,14 @@ FROM docker.io/library/archlinux:latest
 # Bench-server runtime image: arch base + runtime shared libs only.
 # Build context expects bin/ with all four server binaries (built on host).
 # Alternative to sandbox.sh's default bind-mount launch mode.
-RUN pacman -Sy --noconfirm --needed curl openssl zlib >/dev/null 2>&1 \
+RUN pacman -Sy --noconfirm --needed curl openssl zlib sqlite >/dev/null 2>&1 \
     && pacman -Scc --noconfirm >/dev/null 2>&1 || true
 COPY kabelweb-bench /srv/kabelweb-bench
 COPY fiber-bench /srv/fiber-bench
 COPY aspnet-bench /srv/aspnet-bench
 COPY axum-bench /srv/axum-bench
+# Microsoft.Data.Sqlite native engine (probed next to the aspnet binary).
+COPY libe_sqlite3.so /srv/libe_sqlite3.so
 RUN chmod +x /srv/kabelweb-bench /srv/fiber-bench /srv/aspnet-bench /srv/axum-bench
 # Default: kabelweb; override the command to run fiber, aspnet, or axum
 # (see scripts/sandbox.sh server_cmd_of).

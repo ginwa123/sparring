@@ -7,6 +7,7 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
+	_ "modernc.org/sqlite"
 )
 
 // maxBody caps the JSON echo body; matches the kabelweb parser cap (32 KiB).
@@ -25,6 +27,77 @@ const maxBody = 32 * 1024
 type user struct {
 	Username string `json:"username"`
 	Email    string `json:"email"`
+}
+
+// dbUser is the /db/* row shape; field order id,username,email is part of
+// the shared contract (json.Marshal emits struct fields in order, compact).
+type dbUser struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+	Email    string `json:"email"`
+}
+
+const sqliteDSN = "file:/tmp/sparring_sqlite.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+
+// initDB opens the file-backed DB, applies tuning PRAGMAs, and seeds 5000
+// rows in one transaction. Each container seeds its own copy on startup.
+func initDB() *sql.DB {
+	db, err := sql.Open("sqlite", sqliteDSN)
+	if err != nil {
+		log.Fatal(err)
+	}
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(8)
+	for _, p := range []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA busy_timeout=5000",
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA cache_size=-64000",
+		"PRAGMA temp_store=MEMORY",
+	} {
+		if _, err := db.Exec(p); err != nil {
+			log.Fatal(err)
+		}
+	}
+	for _, s := range []string{
+		"DROP TABLE IF EXISTS users",
+		"CREATE TABLE users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, email TEXT NOT NULL)",
+	} {
+		if _, err := db.Exec(s); err != nil {
+			log.Fatal(err)
+		}
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		log.Fatal(err)
+	}
+	stmt, err := tx.Prepare("INSERT INTO users(username, email) VALUES(?, ?)")
+	if err != nil {
+		log.Fatal(err)
+	}
+	for i := 1; i <= 5000; i++ {
+		u := fmt.Sprintf("user_%d", i)
+		if _, err := stmt.Exec(u, u+"@bench.local"); err != nil {
+			stmt.Close()
+			tx.Rollback()
+			log.Fatal(err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		log.Fatal(err)
+	}
+	return db
+}
+
+// dbRowJSON marshals a row with compact field order id,username,email.
+func dbRowJSON(id int64, username, email string) string {
+	b, _ := json.Marshal(dbUser{ID: id, Username: username, Email: email})
+	return string(b)
+}
+
+func validDBUser(u *user) bool {
+	return u.Username != "" && u.Email != ""
 }
 
 // checkout mirrors the shared realistic-payload contract: a cart with items,
@@ -62,6 +135,9 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Hello</title></head><body><h1>Hello, {{.Name}}!</h1></body></html>`))
 
 func main() {
+	db := initDB()
+	defer db.Close()
+
 	app := fiber.New(fiber.Config{
 		AppName:               "fiber-bench",
 		DisableStartupMessage: true,
@@ -185,6 +261,167 @@ func main() {
 		return pageTmpl.Execute(c.Response().BodyWriter(), map[string]any{
 			"Name": template.HTML(html.EscapeString(name)),
 		})
+	})
+
+	// Shared sqlite contract (byte-identical across all four bench servers).
+	app.Get("/db/health", func(c *fiber.Ctx) error {
+		var one int
+		if err := db.QueryRow("SELECT 1").Scan(&one); err != nil {
+			return c.Status(500).SendString("unhealthy")
+		}
+		c.Set("Content-Type", "application/json")
+		return c.SendString(`{"ok":true}`)
+	})
+
+	app.Get("/db/user/:id", func(c *fiber.Ctx) error {
+		id, err := strconv.ParseInt(c.Params("id"), 10, 64)
+		if err != nil || id <= 0 {
+			return c.Status(404).SendString("not found")
+		}
+		var u dbUser
+		err = db.QueryRow("SELECT id, username, email FROM users WHERE id = ?", id).Scan(&u.ID, &u.Username, &u.Email)
+		if err != nil {
+			return c.Status(404).SendString("not found")
+		}
+		c.Set("Content-Type", "application/json")
+		return c.SendString(dbRowJSON(u.ID, u.Username, u.Email))
+	})
+
+	app.Get("/db/users", func(c *fiber.Ctx) error {
+		limit := 20
+		if s := c.Query("limit"); s != "" {
+			n, err := strconv.Atoi(s)
+			if err != nil {
+				n = 20
+			}
+			limit = n
+		}
+		if limit < 1 {
+			limit = 1
+		}
+		if limit > 100 {
+			limit = 100
+		}
+		rows, err := db.Query("SELECT id, username, email FROM users ORDER BY id LIMIT ?", limit)
+		if err != nil {
+			return c.Status(500).SendString("query failed")
+		}
+		defer rows.Close()
+		out := make([]dbUser, 0, limit)
+		for rows.Next() {
+			var u dbUser
+			if err := rows.Scan(&u.ID, &u.Username, &u.Email); err != nil {
+				return c.Status(500).SendString("query failed")
+			}
+			out = append(out, u)
+		}
+		b, _ := json.Marshal(out)
+		c.Set("Content-Type", "application/json")
+		return c.Send(b)
+	})
+
+	app.Post("/db/user", func(c *fiber.Ctx) error {
+		if len(c.Body()) > maxBody {
+			return c.Status(400).SendString("invalid JSON")
+		}
+		var u user
+		if err := json.Unmarshal(c.Body(), &u); err != nil || !validDBUser(&u) {
+			return c.Status(400).SendString("invalid JSON")
+		}
+		res, err := db.Exec("INSERT INTO users(username, email) VALUES(?, ?)", u.Username, u.Email)
+		if err != nil {
+			return c.Status(500).SendString("insert failed")
+		}
+		lid, err := res.LastInsertId()
+		if err != nil {
+			return c.Status(500).SendString("insert failed")
+		}
+		c.Set("Content-Type", "application/json")
+		return c.Status(201).SendString(dbRowJSON(lid, u.Username, u.Email))
+	})
+
+	app.Put("/db/user/:id", func(c *fiber.Ctx) error {
+		id, err := strconv.ParseInt(c.Params("id"), 10, 64)
+		if err != nil || id <= 0 {
+			return c.Status(404).SendString("not found")
+		}
+		if len(c.Body()) > maxBody {
+			return c.Status(400).SendString("invalid JSON")
+		}
+		var u user
+		if err := json.Unmarshal(c.Body(), &u); err != nil || !validDBUser(&u) {
+			return c.Status(400).SendString("invalid JSON")
+		}
+		res, err := db.Exec("UPDATE users SET username = ?, email = ? WHERE id = ?", u.Username, u.Email, id)
+		if err != nil {
+			return c.Status(500).SendString("update failed")
+		}
+		n, err := res.RowsAffected()
+		if err != nil || n == 0 {
+			return c.Status(404).SendString("not found")
+		}
+		var out dbUser
+		err = db.QueryRow("SELECT id, username, email FROM users WHERE id = ?", id).Scan(&out.ID, &out.Username, &out.Email)
+		if err != nil {
+			return c.Status(404).SendString("not found")
+		}
+		c.Set("Content-Type", "application/json")
+		return c.SendString(dbRowJSON(out.ID, out.Username, out.Email))
+	})
+
+	app.Delete("/db/user/:id", func(c *fiber.Ctx) error {
+		id, err := strconv.ParseInt(c.Params("id"), 10, 64)
+		if err != nil || id <= 0 {
+			return c.Status(404).SendString("not found")
+		}
+		res, err := db.Exec("DELETE FROM users WHERE id = ?", id)
+		if err != nil {
+			return c.Status(500).SendString("delete failed")
+		}
+		n, err := res.RowsAffected()
+		if err != nil || n == 0 {
+			return c.Status(404).SendString("not found")
+		}
+		c.Set("Content-Type", "application/json")
+		return c.SendString(fmt.Sprintf(`{"deleted":%d}`, id))
+	})
+
+	app.Get("/db/search", func(c *fiber.Ctx) error {
+		q := c.Query("q")
+		if q == "" {
+			return c.Status(400).SendString("invalid query")
+		}
+		limit := 20
+		if s := c.Query("limit"); s != "" {
+			n, err := strconv.Atoi(s)
+			if err != nil {
+				n = 20
+			}
+			limit = n
+		}
+		if limit < 1 {
+			limit = 1
+		}
+		if limit > 100 {
+			limit = 100
+		}
+		like := "%" + q + "%"
+		rows, err := db.Query("SELECT id, username, email FROM users WHERE username LIKE ? OR email LIKE ? ORDER BY id LIMIT ?", like, like, limit)
+		if err != nil {
+			return c.Status(500).SendString("query failed")
+		}
+		defer rows.Close()
+		out := make([]dbUser, 0, limit)
+		for rows.Next() {
+			var u dbUser
+			if err := rows.Scan(&u.ID, &u.Username, &u.Email); err != nil {
+				return c.Status(500).SendString("query failed")
+			}
+			out = append(out, u)
+		}
+		b, _ := json.Marshal(out)
+		c.Set("Content-Type", "application/json")
+		return c.Send(b)
 	})
 
 	// Listen on all interfaces inside the container namespace; the sandbox

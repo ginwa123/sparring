@@ -19,15 +19,18 @@ use axum::{
     body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query,
+        Path, Query, State,
     },
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
+use r2d2_sqlite::SqliteConnectionManager;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 const MAX_BODY: usize = 32 * 1024;
 
@@ -245,7 +248,305 @@ async fn page(Query(params): Query<HashMap<String, String>>) -> Response {
         .into_response()
 }
 
-fn app() -> Router {
+// ---------------------------------------------------------------------------
+// SQLite scenario (shared contract, byte-identical across all four servers).
+//
+// rusqlite connections are !Sync, so each request checks out one pooled
+// connection and queries inline, blocking the Tokio worker briefly. At
+// worker_threads=2 with a pool of 8 this is fine for the bench workload and
+// keeps the code simple (no spawn_blocking hops). Pool via r2d2 +
+// r2d2-sqlite; rusqlite "bundled" builds its own SQLite so the bench image
+// needs no system sqlite package.
+// ---------------------------------------------------------------------------
+
+const DB_PATH: &str = "/tmp/sparring_sqlite.db";
+const DB_POOL_SIZE: u32 = 8;
+
+type DbPool = r2d2::Pool<SqliteConnectionManager>;
+type SharedPool = Arc<DbPool>;
+
+/// Tuning PRAGMAs from the shared contract. Applied to every new pooled
+/// connection via the manager's init hook, and to the seed connection.
+fn apply_pragmas(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.busy_timeout(Duration::from_millis(5000))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "cache_size", -64000)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    Ok(())
+}
+
+fn build_pool() -> SharedPool {
+    let manager = SqliteConnectionManager::file(DB_PATH).with_init(|c| {
+        apply_pragmas(c).map_err(rusqlite::Error::into)
+    });
+    Arc::new(
+        r2d2::Pool::builder()
+            .max_size(DB_POOL_SIZE)
+            .build(manager)
+            .expect("build sqlite pool"),
+    )
+}
+
+/// Seed: DROP + CREATE + one transaction inserting 5000 rows
+/// (user_{i} / user_{i}@bench.local for i=1..5000). Runs once at startup.
+fn seed_db(pool: &SharedPool) {
+    let mut conn = pool.get().expect("sqlite connection for seed");
+    conn.execute_batch("DROP TABLE IF EXISTS users;")
+        .expect("drop users");
+    conn.execute_batch(
+        "CREATE TABLE users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, email TEXT NOT NULL);",
+    )
+    .expect("create users");
+    let tx = conn.transaction().expect("begin seed tx");
+    {
+        let mut stmt = tx
+            .prepare("INSERT INTO users(username, email) VALUES(?, ?)")
+            .expect("prepare seed insert");
+        for i in 1..=5000 {
+            let username = format!("user_{i}");
+            let email = format!("user_{i}@bench.local");
+            stmt.execute(rusqlite::params![username, email])
+                .expect("seed row");
+        }
+    }
+    tx.commit().expect("commit seed tx");
+}
+
+/// Row shape; serde field order (id, username, email) is the wire order.
+#[derive(Serialize)]
+struct DbUser {
+    id: i64,
+    username: String,
+    email: String,
+}
+
+fn db_row_to_user(row: &rusqlite::Row) -> rusqlite::Result<DbUser> {
+    Ok(DbUser {
+        id: row.get(0)?,
+        username: row.get(1)?,
+        email: row.get(2)?,
+    })
+}
+
+fn db_500() -> Response {
+    text(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
+async fn db_health(State(pool): State<SharedPool>) -> Response {
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return db_500(),
+    };
+    match conn.query_row("SELECT 1", [], |_| Ok(())) {
+        Ok(()) => json(StatusCode::OK, "{\"ok\":true}"),
+        Err(_) => db_500(),
+    }
+}
+
+async fn db_get_user(State(pool): State<SharedPool>, Path(id): Path<String>) -> Response {
+    let id: i64 = match id.parse() {
+        Ok(n) => n,
+        Err(_) => return text(StatusCode::NOT_FOUND, "not found"),
+    };
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return db_500(),
+    };
+    match conn.query_row(
+        "SELECT id, username, email FROM users WHERE id = ?",
+        rusqlite::params![id],
+        db_row_to_user,
+    ) {
+        Ok(u) => match serde_json::to_string(&u) {
+            Ok(s) => json(StatusCode::OK, s),
+            Err(_) => db_500(),
+        },
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            text(StatusCode::NOT_FOUND, "not found")
+        }
+        Err(_) => db_500(),
+    }
+}
+
+async fn db_list_users(
+    State(pool): State<SharedPool>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return db_500(),
+    };
+    let rows = (|| -> rusqlite::Result<Vec<DbUser>> {
+        let mut stmt =
+            conn.prepare("SELECT id, username, email FROM users ORDER BY id LIMIT ?")?;
+        let users = stmt
+            .query_map(rusqlite::params![limit], db_row_to_user)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(users)
+    })();
+    match rows {
+        Ok(users) => match serde_json::to_string(&users) {
+            Ok(s) => json(StatusCode::OK, s),
+            Err(_) => db_500(),
+        },
+        Err(_) => db_500(),
+    }
+}
+
+fn parse_new_user(body: &Bytes) -> Option<(String, String)> {
+    if body.len() > MAX_BODY {
+        return None;
+    }
+    let u: User = serde_json::from_slice(body).ok()?;
+    if u.username.is_empty() || u.email.is_empty() {
+        return None;
+    }
+    Some((u.username, u.email))
+}
+
+async fn db_create_user(State(pool): State<SharedPool>, body: Bytes) -> Response {
+    let (username, email) = match parse_new_user(&body) {
+        Some(v) => v,
+        None => return text(StatusCode::BAD_REQUEST, "invalid JSON"),
+    };
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return db_500(),
+    };
+    match conn.execute(
+        "INSERT INTO users(username, email) VALUES(?, ?)",
+        rusqlite::params![username, email],
+    ) {
+        Ok(_) => {
+            let id = conn.last_insert_rowid();
+            match serde_json::to_string(&DbUser {
+                id,
+                username,
+                email,
+            }) {
+                Ok(s) => json(StatusCode::CREATED, s),
+                Err(_) => db_500(),
+            }
+        }
+        Err(_) => db_500(),
+    }
+}
+
+async fn db_update_user(
+    State(pool): State<SharedPool>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    if body.len() > MAX_BODY {
+        return text(StatusCode::BAD_REQUEST, "invalid JSON");
+    }
+    let id: i64 = match id.parse() {
+        Ok(n) => n,
+        Err(_) => return text(StatusCode::NOT_FOUND, "not found"),
+    };
+    let u: User = match serde_json::from_slice(&body) {
+        Ok(u) => u,
+        Err(_) => return text(StatusCode::BAD_REQUEST, "invalid JSON"),
+    };
+    if u.username.is_empty() || u.email.is_empty() {
+        return text(StatusCode::BAD_REQUEST, "invalid JSON");
+    }
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return db_500(),
+    };
+    let updated = match conn.execute(
+        "UPDATE users SET username = ?, email = ? WHERE id = ?",
+        rusqlite::params![u.username, u.email, id],
+    ) {
+        Ok(n) => n,
+        Err(_) => return db_500(),
+    };
+    if updated == 0 {
+        return text(StatusCode::NOT_FOUND, "not found");
+    }
+    match conn.query_row(
+        "SELECT id, username, email FROM users WHERE id = ?",
+        rusqlite::params![id],
+        db_row_to_user,
+    ) {
+        Ok(user) => match serde_json::to_string(&user) {
+            Ok(s) => json(StatusCode::OK, s),
+            Err(_) => db_500(),
+        },
+        Err(_) => db_500(),
+    }
+}
+
+async fn db_delete_user(
+    State(pool): State<SharedPool>,
+    Path(id): Path<String>,
+) -> Response {
+    let id: i64 = match id.parse() {
+        Ok(n) => n,
+        Err(_) => return text(StatusCode::NOT_FOUND, "not found"),
+    };
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return db_500(),
+    };
+    match conn.execute(
+        "DELETE FROM users WHERE id = ?",
+        rusqlite::params![id],
+    ) {
+        Ok(n) => {
+            if n == 0 {
+                return text(StatusCode::NOT_FOUND, "not found");
+            }
+            json(StatusCode::OK, format!("{{\"deleted\":{id}}}"))
+        }
+        Err(_) => db_500(),
+    }
+}
+
+async fn db_search_users(
+    State(pool): State<SharedPool>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let q = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    if q.is_empty() {
+        return text(StatusCode::BAD_REQUEST, "invalid query");
+    }
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let pattern = format!("%{q}%");
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return db_500(),
+    };
+    let rows = (|| -> rusqlite::Result<Vec<DbUser>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, username, email FROM users WHERE username LIKE ? OR email LIKE ? ORDER BY id LIMIT ?",
+        )?;
+        let users = stmt
+            .query_map(rusqlite::params![pattern, pattern, limit], db_row_to_user)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(users)
+    })();
+    match rows {
+        Ok(users) => match serde_json::to_string(&users) {
+            Ok(s) => json(StatusCode::OK, s),
+            Err(_) => db_500(),
+        },
+        Err(_) => db_500(),
+    }
+}
+
+fn app(pool: SharedPool) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/hello/{name}", get(hello))
@@ -256,6 +557,12 @@ fn app() -> Router {
         .route("/ws", get(ws_handler))
         .route("/events", get(events))
         .route("/page", get(page))
+        .route("/db/health", get(db_health))
+        .route("/db/user/{id}", get(db_get_user).put(db_update_user).delete(db_delete_user))
+        .route("/db/users", get(db_list_users))
+        .route("/db/search", get(db_search_users))
+        .route("/db/user", post(db_create_user))
+        .with_state(pool)
 }
 
 fn main() {
@@ -265,10 +572,12 @@ fn main() {
         .build()
         .expect("build tokio runtime")
         .block_on(async {
+            let pool = build_pool();
+            seed_db(&pool);
             let listener = tokio::net::TcpListener::bind("0.0.0.0:29590")
                 .await
                 .expect("bind 0.0.0.0:29590");
             println!("axum bench server listening on 0.0.0.0:29590");
-            axum::serve(listener, app()).await.expect("serve");
+            axum::serve(listener, app(pool)).await.expect("serve");
         });
 }

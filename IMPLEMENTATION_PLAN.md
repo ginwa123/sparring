@@ -119,3 +119,19 @@ scripts/run-bench.sh            # writes results/*.json, results/*.csv
 
 - Live in `bench/axum/benches/routing.rs`.
 - Run: `cargo bench --manifest-path bench/axum/Cargo.toml`
+
+## SQLite scenario (measured — see SQLITE_BENCHMARK_RESULTS.md)
+
+- Same equal-spec sandbox; 7 `/db/*` endpoints (health/point-read/list/LIKE
+  search/insert/update/delete) on a seeded 5000-row `users` table
+  (`/tmp/sparring_sqlite.db` per container, WAL, `busy_timeout=5000`,
+  `synchronous=NORMAL`, `cache_size=-64000`).
+- One idiomatic sqlite stack per framework: kabelweb→ruangsql (`database.Db`,
+  path dep), fiber→`modernc.org/sqlite` (pool 8), aspnet→
+  `Microsoft.Data.Sqlite 10.0.10` (per-request connections +
+  `libe_sqlite3.so` in image), axum→`rusqlite` bundled + `r2d2` pool 8.
+- Sweeps: `scripts/wrk-sqlite-{read,write,mixed}.lua` via
+  `scripts/run-bench-sqlite.sh` (read = 50/25/25 point/list/search; write =
+  50/50 insert/update; mixed = 50/15/10/10/10/5 + deletes).
+- Caveat: no reseed between runs, so PUT/DELETE 404s drift identically on all
+  frameworks (reported as non-2xx, zero socket errors).
