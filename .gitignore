@@ -1,6 +1,11 @@
 # ── Project outputs (regenerable) ──
 /bin/
 /results/
+# Ad-hoc comparison snapshots of the SAME run, kept side by side to diff a
+# before/after (e.g. the ruangsql sqlite work): results_baseline/ vs
+# results_after/. Same regenerable outputs as results/ — never commit them.
+/results_after/
+/results_baseline/
 *.log
 
 # ── Go ──
